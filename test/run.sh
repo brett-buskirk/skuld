@@ -68,6 +68,8 @@ t_pipe_safety(){
   assert_no_esc "init piped: zero escapes"     "$("$SKULD" init)"
   assert_no_esc "list piped: zero escapes"     "$("$SKULD" list)"
   assert_no_esc "show piped: zero escapes"     "$("$SKULD" show 1)"
+  assert_no_esc "close piped: zero escapes"    "$("$SKULD" close 1)"
+  assert_no_esc "reopen piped: zero escapes"   "$("$SKULD" reopen 1)"
   assert_no_esc "NO_COLOR list: zero escapes"  "$(NO_COLOR=1 "$SKULD" list)"
   assert_no_esc "NO_COLOR help: zero escapes"  "$(NO_COLOR=1 "$SKULD" help)"
 }
@@ -211,6 +213,58 @@ t_atomic(){
   assert_eq "no temp litter after a failed write"      "" "$(find "$SKULD_HOME" -name '.skuld-tmp.*')"
 }
 
+# ── close / reopen / done: the open ⇄ closed state machine ───────────────────────
+t_close_reopen(){
+  fresh; "$SKULD" init >/dev/null
+  "$SKULD" add "task one" >/dev/null    # id 1
+  "$SKULD" add "task two" >/dev/null    # id 2
+
+  # close flips status + stamps completed; the task leaves the open list
+  "$SKULD" close 1 >/dev/null
+  local sh1; sh1="$("$SKULD" show 1)"
+  assert_contains "close sets status closed"    "$sh1" "status     closed"
+  assert_contains "close stamps completed"      "$sh1" "completed"
+  assert_missing  "closed task drops off list"  "$("$SKULD" list)" "task one"
+  assert_contains "footer counts the done"      "$("$SKULD" list)" "1 open · 0 overdue · 1 done"
+
+  # 'done' is an alias for close (quoted so shellcheck doesn't read the loop keyword)
+  "$SKULD" "done" 2 >/dev/null
+  assert_contains "done is an alias for close"  "$("$SKULD" show 2)" "status     closed"
+  assert_contains "both closed → 0 open"        "$("$SKULD" list)" "0 open · 0 overdue · 2 done"
+
+  # reopen flips back to open + clears completed; the task returns to the list
+  "$SKULD" reopen 1 >/dev/null
+  local sh1b; sh1b="$("$SKULD" show 1)"
+  assert_contains "reopen sets status open"     "$sh1b" "status     open"
+  assert_missing  "reopen clears completed"     "$sh1b" "completed"
+  assert_contains "reopened task back on list"  "$("$SKULD" list)" "task one"
+
+  # a non-edited task's fields are preserved through a state change on its sibling
+  assert_contains "sibling record survives edits" "$("$SKULD" show 2)" "task two"
+}
+
+# ── close/reopen: gentle no-ops on the current state, clean errors otherwise ──────
+t_close_reopen_errors(){
+  fresh; "$SKULD" init >/dev/null
+  "$SKULD" add "a task"    >/dev/null   # id 1
+  "$SKULD" add "open task" >/dev/null   # id 2 (stays open)
+  local out rc
+  "$SKULD" close 99  >/dev/null 2>&1; rc=$?; assert_rc "close missing id is rc 1"     1 "$rc"
+  "$SKULD" close 4x  >/dev/null 2>&1; rc=$?; assert_rc "close non-integer id is rc 1" 1 "$rc"
+  "$SKULD" reopen 99 >/dev/null 2>&1; rc=$?; assert_rc "reopen missing id is rc 1"    1 "$rc"
+
+  # re-closing an already-closed task is a gentle no-op (rc 0) — never re-stamps.
+  # The "already closed" message only prints if the guard fired (skipping the mutation).
+  "$SKULD" close 1 >/dev/null
+  out="$("$SKULD" close 1)"; rc=$?
+  assert_rc       "re-closing is a gentle no-op (rc 0)" 0 "$rc"
+  assert_contains "re-closing says already closed"      "$out" "already closed"
+
+  out="$("$SKULD" reopen 2)"; rc=$?
+  assert_rc       "reopening an open task is a no-op (rc 0)" 0 "$rc"
+  assert_contains "reopening an open task says already open" "$out" "already open"
+}
+
 # ── run everything ───────────────────────────────────────────────────────────────
 printf '\nskuld test harness — %s\n\n' "$SKULD"
 [ -x "$SKULD" ] || { printf 'skuld not executable at %s\n' "$SKULD" >&2; exit 2; }
@@ -224,6 +278,8 @@ t_backslash_roundtrip
 t_next_id
 t_due_validation
 t_int_dispatch
+t_close_reopen
+t_close_reopen_errors
 t_atomic
 t_pipe_safety
 t_ladder
