@@ -24,7 +24,7 @@
 # shellcheck disable=SC2059  # color vars are fixed ANSI codes, deliberately embedded in format strings
 set -uo pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 
 # ── configuration — env  >  config file  >  default store ─────────────────────
 # The muninn ladder: capture the SKULD_HOME env override *before* sourcing the
@@ -283,41 +283,111 @@ cmd_add(){
   printf "\n\n"
 }
 
-# ── list — open tasks by default, with a one-line summary footer ───────────────
+# read_totals <today> — store-wide counts "open overdue done" from US records on stdin.
+# The footer always reports these totals, independent of any list filter.
+read_totals(){
+  awk -v today="$1" 'BEGIN{ FS="\037"; o=0; od=0; c=0 }
+    { if ($2=="closed") c++; else { o++; if ($5!="" && $5<today) od++ } }
+    END{ print o, od, c }'
+}
+
+# filter_key <status> <priority> <overdue> <today> <sortkey> — from the US records on
+# stdin, keep those matching the filters and PREPEND a sort key (US-separated) for the
+# caller to sort on and then strip. The record ($0) comes from stdin, never `awk -v`, so
+# its \t/\n escapes are preserved (a -v assignment would un-escape them).
+filter_key(){
+  awk -v st="$1" -v prio="$2" -v overdue="$3" -v today="$4" -v key="$5" '
+    BEGIN{ FS=OFS="\037" }
+    {
+      status=$2; priority=$3; due=$5
+      isover = (status=="open" && due!="" && due<today)
+      if (st=="open"   && status!="open")   next
+      if (st=="closed" && status!="closed") next
+      if (overdue=="1" && !isover)          next
+      if (prio!=""     && priority!=prio)   next
+      if      (key=="created")  k=$4
+      else if (key=="due")      k=(due==""?"9999-99-99":due)               # no-due sorts last
+      else if (key=="priority") k=(priority=="high"?"0":"1") (due==""?"9999-99-99":due)
+      else                      k=sprintf("%020d", $1)                     # id (default)
+      print k, $0
+    }'
+}
+
+# list_label <status> <priority> <overdue> — the human header / empty-message phrase.
+list_label(){
+  local status="$1" priority="$2" overdue="$3" label="all tasks"
+  if [ "$overdue" = 1 ]; then label="overdue tasks"
+  else case "$status" in open) label="open tasks";; closed) label="closed tasks";; esac; fi
+  [ -n "$priority" ] && label="$priority-priority $label"
+  printf '%s' "$label"
+}
+
+# ── list — tasks, with filters, sorting, and a machine-readable mode ───────────
+# Human view: open tasks by default, one aligned line each, with a store-wide summary
+# footer (N open · N overdue · N done — always the whole store, not the filtered view).
+# Filters: --closed / --all / --priority / --overdue. Order: --sort id|due|priority|
+# created (+ --reverse). --porcelain drops color/header/footer for the frozen column
+# contract, so skuld composes into other tools.
+#
+# PORCELAIN CONTRACT — one line per task, TAB-separated, no escapes/color/header/footer;
+# name and description stay backslash-encoded so every record is exactly one line. The
+# column order is FROZEN — later versions only ever append:
+#   id ⇥ status ⇥ priority ⇥ created ⇥ due ⇥ completed ⇥ name ⇥ description
 cmd_list(){
   is_help "${1:-}" && { help_list; return 0; }
-  # v1 slice: open-only. The filters (--closed/--all/--priority/--overdue), --sort/
-  # --reverse, and --porcelain are a later PR; unknown flags warn rather than error.
-  local a
-  for a in "$@"; do case "$a" in
-    -*) printf "  ${Y}ignoring unknown option: %s${X} ${DIM}(filters/sort arrive in a later version)${X}\n" "$a";;
-  esac; done
+  local want_status="open" want_priority="" only_overdue=0 sort_key="id" reverse=0 porcelain=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --open)       want_status="open";;
+    --closed)     want_status="closed";;
+    -a|--all)     want_status="all";;
+    --overdue)    only_overdue=1;;
+    -H|--high)    want_priority="high";;
+    --priority)   shift; case "${1:-}" in
+        high|standard) want_priority="$1";;
+        *) printf "\n  ${R}✗ unknown priority:${X} ${BD}%s${X} ${DIM}(use: standard | high)${X}\n\n" "${1:-}"; return 1;; esac;;
+    --sort)       shift; case "${1:-}" in
+        id|due|priority|created) sort_key="$1";;
+        *) printf "\n  ${R}✗ unknown sort key:${X} ${BD}%s${X} ${DIM}(use: id | due | priority | created)${X}\n\n" "${1:-}"; return 1;; esac;;
+    -r|--reverse) reverse=1;;
+    --porcelain)  porcelain=1;;
+    -*) printf "  ${Y}ignoring unknown option: %s${X}\n" "$1";;
+  esac; shift; done
   ensure_store || return 1
 
   local nowday; nowday="$(today)"
-  local -a rows=()
-  local open=0 overdue=0 closed=0
-  # A record's 8 US-separated fields; the process substitution keeps the counters in
-  # this shell (a `store_read | while` would tally them in a lost subshell).
-  local id status priority created due completed name desc
-  # created/completed/desc are consumed positionally here only to reach name.
-  # shellcheck disable=SC2034
-  while IFS="$US" read -r id status priority created due completed name desc; do
-    [ -z "$id" ] && continue
-    if [ "$status" = closed ]; then closed=$(( closed + 1 )); continue; fi
-    open=$(( open + 1 ))
-    local od=0
-    if is_overdue "$due" "$status" "$nowday"; then overdue=$(( overdue + 1 )); od=1; fi
-    rows+=("$(fmt_row "$id" "$priority" "$due" "$od" "$name")")
-  done < <(store_read)
+  # filtered + sorted records (US-separated): prepend a sort key, sort on it, strip it.
+  # -s keeps ties in store (id) order, so output is deterministic.
+  local -a sortcmd=(sort -s -t "$US" "-k1,1"); [ "$reverse" = 1 ] && sortcmd+=(-r)
+  local records
+  records="$(store_read \
+    | filter_key "$want_status" "$want_priority" "$only_overdue" "$nowday" "$sort_key" \
+    | "${sortcmd[@]}" | cut -d "$US" -f2-)"
 
-  printf "\n  ${BD}skuld${X}  ${DIM}·  open tasks${X}\n\n"
-  if [ "${#rows[@]}" -eq 0 ]; then
-    note "no open tasks — 'skuld add <name>' to add one."
-  else
-    local r; for r in "${rows[@]}"; do printf '%s\n' "$r"; done
+  # porcelain: the frozen contract only — no color, header, or footer.
+  if [ "$porcelain" = 1 ]; then
+    [ -n "$records" ] && printf '%s\n' "$records" | tr '\037' '\t'
+    return 0
   fi
-  printf "\n  ${DIM}%d open · %d overdue · %d done${X}\n\n" "$open" "$overdue" "$closed"
+
+  local label; label="$(list_label "$want_status" "$want_priority" "$only_overdue")"
+  printf "\n  ${BD}skuld${X}  ${DIM}·  %s${X}\n\n" "$label"
+  if [ -z "$records" ]; then
+    note "no $label — 'skuld add <name>' to add one."
+  else
+    local id status priority created due completed name desc
+    # created/completed/desc are consumed positionally only to reach name.
+    # shellcheck disable=SC2034
+    while IFS="$US" read -r id status priority created due completed name desc; do
+      [ -z "$id" ] && continue
+      local od=0; is_overdue "$due" "$status" "$nowday" && od=1
+      fmt_row "$id" "$priority" "$due" "$od" "$name"; printf '\n'
+    done <<< "$records"
+  fi
+
+  # footer — always the whole store, filter-independent
+  local t_open t_overdue t_done
+  read -r t_open t_overdue t_done < <(store_read | read_totals "$nowday")
+  printf "\n  ${DIM}%d open · %d overdue · %d done${X}\n\n" "$t_open" "$t_overdue" "$t_done"
 }
 
 # fmt_row <id> <priority> <due> <overdue-flag> <name> — one aligned task line for the
@@ -338,8 +408,9 @@ fmt_row(){
 # ── show — one task in full ────────────────────────────────────────────────────
 cmd_show(){
   is_help "${1:-}" && { help_show; return 0; }
-  local id="" a
+  local id="" porcelain=0 a
   for a in "$@"; do case "$a" in
+    --porcelain) porcelain=1;;
     -*) printf "  ${Y}ignoring unknown option: %s${X}\n" "$a";;
     *) [ -z "$id" ] && id="$a";;
   esac; done
@@ -354,6 +425,9 @@ cmd_show(){
     note "list your open tasks with:  skuld list"
     printf "\n"; return 1
   fi
+  # porcelain: the one record as a TAB-separated line — same frozen column contract as
+  # 'list --porcelain' (see cmd_list). No color, labels, or blank lines.
+  if [ "$porcelain" = 1 ]; then printf '%s\n' "$rec" | tr '\037' '\t'; return 0; fi
   local f_id f_status f_priority f_created f_due f_completed f_name f_desc
   IFS="$US" read -r f_id f_status f_priority f_created f_due f_completed f_name f_desc <<< "$rec"
 
@@ -563,17 +637,26 @@ help_add(){
   printf "    skuld add -H --due 2026-08-01 -d \"draft + review\" \"Ship the release\"\n\n"
 }
 help_list(){
-  printf "\n  ${BD}skuld list${X}   ${DIM}(alias: ls)${X}\n\n"
-  printf "  List your ${BD}open${X} tasks — id, priority ${DIM}(!)${X}, name, and due date, with overdue dates\n"
-  printf "  called out. Closes with a summary footer ${DIM}(N open · N overdue · N done)${X}.\n\n"
-  printf "  ${DIM}Bare ${X}${BD}skuld${X}${DIM} with no verb is the same as ${X}${BD}skuld list${X}${DIM}. Filters, sorting, and a\n"
-  printf "  --porcelain mode land in a later version.${X}\n\n"
+  printf "\n  ${BD}skuld list${X} [filters] [--sort KEY] [--reverse] [--porcelain]   ${DIM}(alias: ls)${X}\n\n"
+  printf "  List tasks — by default your ${BD}open${X} ones: id, priority ${DIM}(!)${X}, name, and due date, with\n"
+  printf "  overdue dates called out. Closes with a summary footer ${DIM}(N open · N overdue · N done,\n"
+  printf "  always store-wide)${X}. Bare ${BD}skuld${X} is the same as ${BD}skuld list${X}.\n\n"
+  printf "  ${BD}Filters${X}\n"
+  printf "    --closed             only closed tasks           --all, -a   open + closed\n"
+  printf "    --overdue            only overdue (open, past due)\n"
+  printf "    --priority <level>   only ${BD}standard${X} | ${BD}high${X} ${DIM}(-H = --priority high)${X}\n"
+  printf "  ${BD}Order${X}\n"
+  printf "    --sort <key>         ${BD}id${X} ${DIM}(default)${X} | ${BD}due${X} | ${BD}priority${X} | ${BD}created${X}\n"
+  printf "    -r, --reverse        reverse the sort\n"
+  printf "  ${BD}Scripting${X}\n"
+  printf "    --porcelain          stable, escape-free, TAB-separated columns ${DIM}(no color/footer)${X}:\n"
+  printf "                         ${DIM}id·status·priority·created·due·completed·name·description${X}\n\n"
 }
 help_show(){
-  printf "\n  ${BD}skuld show${X} <id>   ${DIM}(alias: view)${X}\n\n"
+  printf "\n  ${BD}skuld show${X} <id> [--porcelain]   ${DIM}(alias: view)${X}\n\n"
   printf "  Show one task in full — status, priority, timestamps, due date, and description.\n"
-  printf "  ${DIM}Bare ${X}${BD}skuld <id>${X}${DIM} with no verb is the same as ${X}${BD}skuld show <id>${X}${DIM} (an integer is\n"
-  printf "  unambiguously not a verb).${X}\n\n"
+  printf "  ${BD}--porcelain${X} prints the single record as one TAB-separated line ${DIM}(the same frozen\n"
+  printf "  column contract as ${X}${BD}list --porcelain${X}${DIM})${X}. Bare ${BD}skuld <id>${X} is the same as ${BD}skuld show <id>${X}.\n\n"
 }
 help_close(){
   printf "\n  ${BD}skuld close${X} <id>   ${DIM}(alias: done)${X}\n\n"
@@ -617,8 +700,8 @@ cmd_help(){
   printf "    ${BD}reopen${X} <id>               reopen a closed task\n"
   printf "    ${BD}rm${X} <id> [--force]         soft-delete a task ${DIM}(to .trash/; alias: del)${X}\n"
   printf "  ${DIM}read${X}\n"
-  printf "    ${BD}list${X}                      open tasks, with a summary footer ${DIM}(alias: ls)${X}\n"
-  printf "    ${BD}show${X} <id>                 one task in full ${DIM}(alias: view)${X}\n"
+  printf "    ${BD}list${X} [filters]            tasks ${DIM}(--closed/--all/--overdue/--priority · --sort · --porcelain)${X}\n"
+  printf "    ${BD}show${X} <id>                 one task in full ${DIM}(--porcelain · alias: view)${X}\n"
   printf "  ${DIM}setup${X}\n"
   printf "    ${BD}init${X}                      scaffold the store + a starter config\n"
   printf "    ${BD}help${X} ${DIM}·${X} ${BD}version${X}          this menu · the version\n\n"
