@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# skuld — a pocket CLI task-tracker: the ledger of what you owe your future self.
+#
+# Skuld is the Norn who governs what shall be — her name is cognate with "shall"
+# and "should", and carries the older sense of *debt, obligation, that-which-must-
+# become*. So skuld is edda's sibling and mirror: edda records what *was* (a vault
+# of notes), skuld records what *shall be* (a checklist of tasks). It owns exactly
+# one directory — the store — and never reaches beyond it: every write lands inside
+# $SKULD_HOME, mutations are atomic, nothing is ever hard-deleted, and skuld never
+# phones home.
+#
+#   skuld init               scaffold the store
+#
+#   skuld help  ·  skuld <command> help   for the menu and per-command detail.
+#
+# Deps: bash + coreutils, nothing else. Fully offline; the store is a single
+# tab-separated file you can read, grep, and back up yourself. Drop it in
+# ~/.local/bin and run it anywhere.
+# shellcheck disable=SC2059  # color vars are fixed ANSI codes, deliberately embedded in format strings
+set -uo pipefail
+
+VERSION="0.1.0"
+
+# ── configuration — env  >  config file  >  default store ─────────────────────
+# The muninn ladder: capture the SKULD_HOME env override *before* sourcing the
+# config (so the environment always wins over the file), source the config if it
+# exists, then resolve env > file > default. The config is a plain sourced shell
+# file that sets SKULD_HOME=…; 'skuld init' writes a starter one.
+CONFIG="${SKULD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/skuld/config}"
+_env_HOME="${SKULD_HOME-}"
+# shellcheck source=/dev/null
+[ -f "$CONFIG" ] && . "$CONFIG"
+DEFAULT_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/skuld"
+SKULD_HOME="${_env_HOME:-${SKULD_HOME:-$DEFAULT_HOME}}"
+STORE="$SKULD_HOME/tasks.tsv"          # the ledger: one task per line, tab-separated
+TRASH="$SKULD_HOME/.trash"             # soft-deletes land here; never a hard delete
+
+# ── palette — color only on a TTY, and never when NO_COLOR is set ─────────────
+# Same convention as the rest of the pack: piped/redirected output, or NO_COLOR,
+# collapses every escape to an empty string, so output is plain text downstream.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'; DIM=$'\e[2m'; BD=$'\e[1m'; X=$'\e[0m'
+else R=; G=; Y=; C=; DIM=; BD=; X=; fi
+
+# ── small helpers ─────────────────────────────────────────────────────────────
+is_help(){ case "${1:-}" in help|-h|--help) return 0;; *) return 1;; esac; }
+note(){ printf "    ${DIM}%s${X}\n" "$1"; }                    # a dim aside
+
+# ── init — scaffold the store (ledger + .trash/) and a starter config ──────────
+cmd_init(){
+  is_help "${1:-}" && { help_init; return 0; }
+  local force=0 a
+  for a in "$@"; do case "$a" in
+    -f|--force) force=1;;
+    -*) printf "  ${Y}ignoring unknown option: %s${X}\n" "$a";;
+  esac; done
+
+  printf "\n  ${BD}skuld init${X}\n\n"
+
+  # 1. the store dir + its .trash/ (where a future 'rm' soft-deletes to — never rm -f)
+  if [ -d "$SKULD_HOME" ]; then
+    printf "  ${DIM}·${X} store already exists → ${C}%s${X}\n" "$SKULD_HOME"
+  else
+    mkdir -p "$SKULD_HOME" || { printf "  ${R}✗ couldn't create the store at %s${X}\n\n" "$SKULD_HOME"; return 1; }
+    printf "  ${G}✓${X} created store → ${C}%s${X}\n" "$SKULD_HOME"
+  fi
+  mkdir -p "$TRASH"
+
+  # 2. the ledger itself — a single tab-separated file, one task per line. Created
+  # empty; the first 'add' fills it. NEVER clobber an existing ledger (the guard
+  # below is why a re-init can't truncate real task data out from under you).
+  if [ -f "$STORE" ]; then
+    printf "  ${DIM}·${X} ledger already exists → ${C}%s${X}\n" "$STORE"
+  else
+    : > "$STORE" || { printf "  ${R}✗ couldn't create the ledger at %s${X}\n\n" "$STORE"; return 1; }
+    printf "  ${G}✓${X} created ledger → ${C}%s${X}\n" "$STORE"
+  fi
+
+  # 3. a starter config (a plain sourced shell file; the env still overrides it)
+  if [ -f "$CONFIG" ] && [ "$force" = 0 ]; then
+    printf "  ${DIM}·${X} config already exists → ${C}%s${X} ${DIM}(skuld init --force to overwrite)${X}\n" "$CONFIG"
+  else
+    mkdir -p "$(dirname "$CONFIG")"
+    cat > "$CONFIG" <<CFG
+# skuld configuration — https://github.com/brett-buskirk/skuld
+# A plain sourced shell file. SKULD_HOME in the environment overrides this.
+SKULD_HOME="$SKULD_HOME"
+CFG
+    printf "  ${G}✓${X} wrote config → ${C}%s${X}\n" "$CONFIG"
+  fi
+
+  printf "\n  ${DIM}store ready — 'skuld add <name>' to write your first task.${X}\n"
+  note "tip: point SKULD_HOME at a synced/versioned dir — your task ledger is state worth backing up."
+  printf "\n"
+}
+
+# ── per-command help ──────────────────────────────────────────────────────────
+help_init(){
+  printf "\n  ${BD}skuld init${X} [--force]\n\n"
+  printf "  Scaffold the store — the ledger ${DIM}(tasks.tsv)${X} and its ${BD}.trash/${X} — and write a starter\n"
+  printf "  config. Idempotent — safe to run again ${DIM}(it never clobbers an existing ledger)${X};\n"
+  printf "  ${BD}--force${X} overwrites an existing config.\n\n"
+  printf "  Resolves the store the same way every command does: ${BD}SKULD_HOME${X} env > the config file\n"
+  printf "  > the default ${DIM}(%s)${X}.\n\n" "$DEFAULT_HOME"
+}
+
+# ── help — the menu ────────────────────────────────────────────────────────────
+cmd_help(){
+  printf "\n  ${BD}skuld${X} ${DIM}— the ledger of what you owe your future self · v%s${X}\n\n" "$VERSION"
+  printf "  ${DIM}setup${X}\n"
+  printf "    ${BD}init${X}                      scaffold the store + a starter config\n"
+  printf "    ${BD}help${X} ${DIM}·${X} ${BD}version${X}          this menu · the version\n\n"
+  printf "  ${DIM}store:${X} ${C}%s${X}\n" "$SKULD_HOME"
+  printf "  ${DIM}run${X} ${BD}skuld <command> help${X} ${DIM}for details on any command.${X}\n\n"
+}
+
+# ── dispatch — verbs win the first position ─────────────────────────────────────
+# The dispatcher is CLOSED: only the fixed verb set reaches the first position. The
+# design's two non-verb arms — an empty invocation → 'list' open tasks, and a bare
+# integer → 'show' that task — arrive alongside those commands in a later PR; until
+# then the store can be scaffolded with 'init' and inspected via 'help'.
+case "${1:-}" in
+  init)                   shift; cmd_init "$@";;
+  help|-h|--help)         cmd_help;;
+  version|-V|--version)   printf "skuld %s\n" "$VERSION";;
+  "")                     cmd_help;;
+  *)
+    printf "\n  ${R}no such command:${X} ${BD}%s${X}\n" "$1"
+    cmd_help
+    exit 1
+    ;;
+esac
