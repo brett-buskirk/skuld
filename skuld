@@ -10,8 +10,9 @@
 # phones home.
 #
 #   skuld add <name…>        add a task            skuld list              open tasks
-#   skuld show <id>          a task in full        skuld close <id>        mark it done
-#   skuld reopen <id>        reopen a task         skuld init              scaffold the store
+#   skuld show <id>          a task in full        skuld edit <id> …       change a field
+#   skuld close <id>         mark it done          skuld reopen <id>       reopen a task
+#   skuld rm <id>            soft-delete a task    skuld init              scaffold the store
 #   skuld                    (no verb) list open tasks
 #   skuld <id>               (no verb) show that task
 #
@@ -23,7 +24,7 @@
 # shellcheck disable=SC2059  # color vars are fixed ANSI codes, deliberately embedded in format strings
 set -uo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 # ── configuration — env  >  config file  >  default store ─────────────────────
 # The muninn ladder: capture the SKULD_HOME env override *before* sourcing the
@@ -161,6 +162,20 @@ set_task_state(){
   store_read \
     | awk -v id="$id" -v st="$status" -v cp="$completed" \
         'BEGIN{ FS=OFS="\037" } ($1+0)==(id+0){ $2=st; $6=cp } { print }' \
+    | store_write
+}
+
+# replace_task <id> <new-record> — swap the record with matching id for <new-record>
+# (a full US-separated line), leaving every other record byte-identical, then atomically
+# replace the store. The mutator 'edit' drives; <new-record> is built by build_record so
+# its name/description are already encoded. The new record is passed through the
+# ENVIRONMENT, not `awk -v` — awk interprets backslash escapes in a -v assignment, which
+# would turn the encoded \t/\n back into real tabs/newlines and shear the record.
+replace_task(){
+  local id="$1" newrec="$2"
+  store_read \
+    | SKULD_NEWREC="$newrec" awk -v id="$id" \
+        'BEGIN{ FS="\037" } ($1+0)==(id+0){ print ENVIRON["SKULD_NEWREC"]; next } { print }' \
     | store_write
 }
 
@@ -411,6 +426,121 @@ cmd_reopen(){
   printf "\n  ${G}✓ reopened${X} ${DIM}#%s${X} ${BD}%s${X}\n\n" "$(( 10#$id ))" "$name"
 }
 
+# ── edit — change a task's fields (flag-based, for scriptability) ────────────────
+# Only the fields you name change; everything else (id, status, created, completed) is
+# preserved. The free-text fields are decoded to raw, overridden, then re-encoded by
+# build_record — so editing #5's name never disturbs its description's escapes, and a
+# tab or newline you type survives. An empty --due/--desc CLEARS that field; --name
+# must stay non-empty (a task needs a name).
+cmd_edit(){
+  is_help "${1:-}" && { help_edit; return 0; }
+  local id="" set_name=0 set_desc=0 set_priority=0 set_due=0
+  local new_name="" new_desc="" new_priority="" new_due=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --name)     shift; new_name="${1:-}";     set_name=1;;
+    -d|--desc|--description) shift; new_desc="${1:-}"; set_desc=1;;
+    -H|--high)  new_priority="high";          set_priority=1;;
+    --priority) shift; new_priority="${1:-}"; set_priority=1;;
+    --due)      shift; new_due="${1:-}";      set_due=1;;
+    --)         shift; [ -z "$id" ] && [ $# -gt 0 ] && { id="$1"; shift; };;
+    -*)         printf "  ${Y}ignoring unknown option: %s${X}\n" "$1";;
+    *)          [ -z "$id" ] && id="$1";;
+  esac; shift; done
+
+  ensure_store || return 1
+  [ -z "$id" ] && { printf "\n  ${R}usage:${X} skuld edit <id> [--name …] [-d desc] [--priority …|-H] [--due …]\n\n"; return 1; }
+  is_int "$id" || { printf "\n  ${R}✗ not a task id:${X} ${BD}%s${X} ${DIM}(task ids are integers)${X}\n\n" "$id"; return 1; }
+  if [ "$(( set_name + set_desc + set_priority + set_due ))" -eq 0 ]; then
+    printf "\n  ${R}✗ nothing to edit${X} ${DIM}— give at least one of --name / --desc / --priority / --due.${X}\n\n"; return 1
+  fi
+  # validate the requested changes BEFORE touching the store
+  if [ "$set_priority" = 1 ]; then case "$new_priority" in
+    standard|high) ;; *) printf "\n  ${R}✗ unknown priority:${X} ${BD}%s${X} ${DIM}(use: standard | high)${X}\n\n" "$new_priority"; return 1;; esac
+  fi
+  if [ "$set_due" = 1 ] && [ -n "$new_due" ] && ! valid_due "$new_due"; then
+    printf "\n  ${R}✗ invalid --due:${X} ${BD}%s${X} ${DIM}(YYYY-MM-DD, or '' to clear it)${X}\n\n" "$new_due"; return 1
+  fi
+  if [ "$set_name" = 1 ] && [ -z "${new_name// /}" ]; then
+    printf "\n  ${R}✗ a task needs a name${X} ${DIM}(--name can't be empty).${X}\n\n"; return 1
+  fi
+
+  local rec; rec="$(store_read | find_task "$id")"
+  if [ -z "$rec" ]; then
+    printf "\n  ${R}✗ no task${X} ${BD}#%s${X}\n" "$(( 10#$id ))"
+    note "list your tasks with:  skuld list"; printf "\n"; return 1
+  fi
+  local c_id c_status c_priority c_created c_due c_completed c_name c_desc
+  IFS="$US" read -r c_id c_status c_priority c_created c_due c_completed c_name c_desc <<< "$rec"
+  c_name="$(dec "$c_name")"; c_desc="$(dec "$c_desc")"          # to raw before overriding
+  [ "$set_name" = 1 ]     && c_name="$new_name"
+  [ "$set_desc" = 1 ]     && c_desc="$new_desc"
+  [ "$set_priority" = 1 ] && c_priority="$new_priority"
+  [ "$set_due" = 1 ]      && c_due="$new_due"
+
+  local newrec; newrec="$(build_record "$c_id" "$c_status" "$c_priority" "$c_created" "$c_due" "$c_completed" "$c_name" "$c_desc")"
+  if ! replace_task "$id" "$newrec"; then
+    printf "\n  ${R}✗ couldn't update the task — the store is unchanged.${X}\n\n"; return 1
+  fi
+  printf "\n  ${G}✓ edited${X} ${DIM}#%s${X} ${BD}%s${X}\n\n" "$(( 10#$id ))" "$c_name"
+}
+
+# confirm <question> — ask once, reading /dev/tty directly so a piped/redirected stdin
+# can't silently auto-confirm a delete. Probe that /dev/tty can actually be OPENED (in
+# some sandboxes the node exists but opening it fails), and never leave reply unset under
+# `set -u`. The pack's safety spine — the gate for rm. Returns 0 to proceed, 1 to abort.
+confirm(){
+  local reply=""
+  if ! { : < /dev/tty; } 2>/dev/null; then
+    printf "  ${Y}no usable terminal for confirmation — pass --force to proceed non-interactively.${X}\n" >&2
+    return 1
+  fi
+  printf "  ${Y}%s${X} ${DIM}[y/N]${X} " "$1" > /dev/tty 2>/dev/null
+  read -r reply < /dev/tty 2>/dev/null || reply=""
+  case "$reply" in y|Y|yes|YES) return 0;; *) return 1;; esac
+}
+
+# ── rm — soft-delete a task to $SKULD_HOME/.trash/ (never a hard delete) ─────────
+# The one destructive-adjacent verb, and it is NEVER a hard delete: the record is first
+# APPENDED to the trash ledger ($SKULD_HOME/.trash/tasks.tsv) — so it's saved before the
+# main store loses it — and only then removed from the store atomically. If the second
+# step fails, the task is duplicated (recoverable), never lost. Confirms once via
+# /dev/tty (a pipe can't auto-confirm); --force skips the prompt.
+cmd_rm(){
+  is_help "${1:-}" && { help_rm; return 0; }
+  local id="" force=0 a
+  for a in "$@"; do case "$a" in
+    -f|--force|-y|--yes) force=1;;
+    -*) printf "  ${Y}ignoring unknown option: %s${X}\n" "$a";;
+    *) [ -z "$id" ] && id="$a";;
+  esac; done
+  ensure_store || return 1
+  [ -z "$id" ] && { printf "\n  ${R}usage:${X} skuld rm <id> [--force]\n\n"; return 1; }
+  is_int "$id" || { printf "\n  ${R}✗ not a task id:${X} ${BD}%s${X} ${DIM}(task ids are integers)${X}\n\n" "$id"; return 1; }
+  local rec; rec="$(store_read | find_task "$id")"
+  if [ -z "$rec" ]; then
+    printf "\n  ${R}✗ no task${X} ${BD}#%s${X}\n" "$(( 10#$id ))"
+    note "list your tasks with:  skuld list"; printf "\n"; return 1
+  fi
+  local name; name="$(dec "$(printf '%s' "$rec" | field 7)")"
+
+  if [ "$force" != 1 ] && ! confirm "remove #$(( 10#$id )) \"$name\"?  (it moves to the trash)"; then
+    printf "  ${DIM}aborted — nothing removed.${X}\n\n"; return 0
+  fi
+
+  # 1. save the record to the trash ledger FIRST (append; the record is never lost)…
+  mkdir -p "$TRASH"
+  if ! printf '%s\n' "$rec" | tr '\037' '\t' >> "$TRASH/tasks.tsv"; then
+    printf "\n  ${R}✗ couldn't write to the trash — nothing removed.${X}\n\n"; return 1
+  fi
+  # 2. …then rewrite the store without this record (atomic).
+  if ! store_read | awk -v id="$id" 'BEGIN{ FS="\037" } ($1+0)!=(id+0)' | store_write; then
+    printf "\n  ${R}✗ couldn't update the store — the task is still present (and now also in the trash).${X}\n\n"; return 1
+  fi
+  printf "\n  ${G}✓ removed${X} ${DIM}#%s${X} ${BD}%s${X} ${DIM}→ %s${X}\n" "$(( 10#$id ))" "$name" "$TRASH/tasks.tsv"
+  note "it's soft-deleted — the record is recoverable from the trash ledger above."
+  printf "\n"
+}
+
 # ── per-command help ──────────────────────────────────────────────────────────
 help_init(){
   printf "\n  ${BD}skuld init${X} [--force]\n\n"
@@ -456,14 +586,36 @@ help_reopen(){
   printf "  Reopen a closed task — flips it back to ${BD}open${X} and clears its ${BD}completed${X} stamp, so it\n"
   printf "  returns to ${BD}skuld list${X}. Reopening an already-open task is a no-op.\n\n"
 }
+help_edit(){
+  printf "\n  ${BD}skuld edit${X} <id> [--name …] [-d desc] [--priority std|high | -H] [--due …]\n\n"
+  printf "  Change a task's fields — only the ones you name; ${BD}id${X}, ${BD}status${X}, and timestamps are left\n"
+  printf "  alone ${DIM}(use close/reopen for status)${X}. Flag-based so it scripts cleanly.\n\n"
+  printf "  ${BD}Options${X}\n"
+  printf "    --name <text>           rename the task ${DIM}(can't be empty)${X}\n"
+  printf "    -d, --desc <text>       set the description ${DIM}(empty string clears it)${X}\n"
+  printf "    --priority <level> / -H  set ${BD}standard${X} | ${BD}high${X}\n"
+  printf "    --due <YYYY-MM-DD>      set the due date ${DIM}(empty string clears it)${X}\n\n"
+  printf "  ${BD}Example${X}\n"
+  printf "    skuld edit 5 --priority high --due 2026-09-01\n\n"
+}
+help_rm(){
+  printf "\n  ${BD}skuld rm${X} <id> [--force]   ${DIM}(alias: del)${X}\n\n"
+  printf "  ${BD}Soft-delete${X} a task — its record moves to ${BD}\$SKULD_HOME/.trash/tasks.tsv${X}, never an\n"
+  printf "  unrecoverable delete. Confirms once ${DIM}(reading /dev/tty, so a pipe can't auto-confirm)${X};\n"
+  printf "  ${BD}--force${X} skips the prompt. Restore by moving the record back into the store.\n\n"
+  printf "  ${BD}Options${X}\n"
+  printf "    -f, --force   skip the confirmation prompt\n\n"
+}
 
 # ── help — the menu ────────────────────────────────────────────────────────────
 cmd_help(){
   printf "\n  ${BD}skuld${X} ${DIM}— the ledger of what you owe your future self · v%s${X}\n\n" "$VERSION"
   printf "  ${DIM}write${X}\n"
   printf "    ${BD}add${X} <name…>               add a task ${DIM}(-H high · --due · -d desc · alias: new)${X}\n"
+  printf "    ${BD}edit${X} <id> [--name …]      change a task's fields ${DIM}(--name/--desc/--priority/--due)${X}\n"
   printf "    ${BD}close${X} <id>                mark a task done ${DIM}(alias: done)${X}\n"
   printf "    ${BD}reopen${X} <id>               reopen a closed task\n"
+  printf "    ${BD}rm${X} <id> [--force]         soft-delete a task ${DIM}(to .trash/; alias: del)${X}\n"
   printf "  ${DIM}read${X}\n"
   printf "    ${BD}list${X}                      open tasks, with a summary footer ${DIM}(alias: ls)${X}\n"
   printf "    ${BD}show${X} <id>                 one task in full ${DIM}(alias: view)${X}\n"
@@ -482,8 +634,10 @@ cmd_help(){
 # unambiguously not a verb). Nothing else free-form reaches this position.
 case "${1:-}" in
   add|new)                shift; cmd_add "$@";;
+  edit)                   shift; cmd_edit "$@";;
   close|done)             shift; cmd_close "$@";;
   reopen)                 shift; cmd_reopen "$@";;
+  rm|del)                 shift; cmd_rm "$@";;
   list|ls)                shift; cmd_list "$@";;
   show|view)              shift; cmd_show "$@";;
   init)                   shift; cmd_init "$@";;

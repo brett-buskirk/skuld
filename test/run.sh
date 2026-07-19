@@ -70,6 +70,8 @@ t_pipe_safety(){
   assert_no_esc "show piped: zero escapes"     "$("$SKULD" show 1)"
   assert_no_esc "close piped: zero escapes"    "$("$SKULD" close 1)"
   assert_no_esc "reopen piped: zero escapes"   "$("$SKULD" reopen 1)"
+  assert_no_esc "edit piped: zero escapes"     "$("$SKULD" edit 1 --priority high)"
+  assert_no_esc "rm piped: zero escapes"       "$("$SKULD" rm 1 --force)"
   assert_no_esc "NO_COLOR list: zero escapes"  "$(NO_COLOR=1 "$SKULD" list)"
   assert_no_esc "NO_COLOR help: zero escapes"  "$(NO_COLOR=1 "$SKULD" help)"
 }
@@ -265,6 +267,86 @@ t_close_reopen_errors(){
   assert_contains "reopening an open task says already open" "$out" "already open"
 }
 
+# ── edit: flag-based field edits; preserves everything you don't name ────────────
+t_edit(){
+  fresh; "$SKULD" init >/dev/null
+  "$SKULD" add -d "keep me" "first" >/dev/null   # id 1
+  "$SKULD" add "second" >/dev/null               # id 2 (sibling)
+  local created1; created1="$(awk -F'\t' '$1==1{print $4}' "$SKULD_HOME/tasks.tsv")"
+
+  "$SKULD" edit 1 --name "renamed" --priority high --due 2099-01-01 >/dev/null
+  local sh; sh="$("$SKULD" show 1)"
+  assert_contains "edit renames"           "$sh" "renamed"
+  assert_contains "edit sets priority"     "$sh" "priority   high"
+  assert_contains "edit sets due"          "$sh" "2099-01-01"
+  assert_contains "edit preserves desc"    "$sh" "keep me"
+  assert_eq       "edit preserves created" "$created1" "$(awk -F'\t' '$1==1{print $4}' "$SKULD_HOME/tasks.tsv")"
+  assert_contains "sibling record untouched" "$("$SKULD" show 2)" "second"
+
+  # empty --due / --desc clear those fields
+  "$SKULD" edit 1 --due "" --desc "" >/dev/null
+  sh="$("$SKULD" show 1)"
+  assert_missing "edit --due '' clears due"   "$sh" "2099-01-01"
+  assert_missing "edit --desc '' clears desc" "$sh" "keep me"
+
+  # validation — each rejects with rc 1, before touching the store
+  local rc
+  "$SKULD" edit 1 >/dev/null 2>&1;                 rc=$?; assert_rc "edit with no fields is rc 1" 1 "$rc"
+  "$SKULD" edit 1 --name "" >/dev/null 2>&1;       rc=$?; assert_rc "edit empty name is rc 1"     1 "$rc"
+  "$SKULD" edit 1 --due bad >/dev/null 2>&1;       rc=$?; assert_rc "edit bad due is rc 1"        1 "$rc"
+  "$SKULD" edit 1 --priority huge >/dev/null 2>&1; rc=$?; assert_rc "edit bad priority is rc 1"   1 "$rc"
+  "$SKULD" edit 99 --name x >/dev/null 2>&1;       rc=$?; assert_rc "edit missing id is rc 1"     1 "$rc"
+  "$SKULD" edit 4x --name x >/dev/null 2>&1;       rc=$?; assert_rc "edit non-integer id is rc 1" 1 "$rc"
+}
+
+# ── edit re-encodes correctly and can't corrupt a sibling field in the record ─────
+t_edit_roundtrip(){
+  fresh; "$SKULD" init >/dev/null
+  "$SKULD" add -d $'desc\twith\ttabs' "orig" >/dev/null   # id 1, desc holds tabs
+  # rename to a value that itself contains a tab; the desc (a different field in the
+  # SAME record) must survive — editing the name must not corrupt desc's escaping.
+  "$SKULD" edit 1 --name $'new\tname' >/dev/null
+  assert_eq       "record still one physical line"     "1" "$(grep -c '' "$SKULD_HOME/tasks.tsv")"
+  local sh; sh="$("$SKULD" show 1)"
+  assert_contains "edited name round-trips with tab"   "$sh" $'new\tname'
+  assert_contains "desc preserved through a name edit"  "$sh" $'desc\twith\ttabs'
+}
+
+# ── rm: soft-delete to .trash/, the /dev/tty confirm gate, and the del alias ──────
+t_rm(){
+  fresh; "$SKULD" init >/dev/null
+  "$SKULD" add "doomed" >/dev/null   # id 1
+  "$SKULD" add "kept"   >/dev/null   # id 2
+
+  # --force soft-deletes: gone from the store, saved intact in the trash ledger
+  "$SKULD" rm 1 --force >/dev/null
+  assert_missing  "rm --force removes from the store" "$(cat "$SKULD_HOME/tasks.tsv")" "doomed"
+  assert_file     "rm creates the trash ledger"       "$SKULD_HOME/.trash/tasks.tsv"
+  assert_contains "removed record saved to trash"     "$(cat "$SKULD_HOME/.trash/tasks.tsv")" "doomed"
+  local rc; "$SKULD" show 1 >/dev/null 2>&1; rc=$?
+  assert_rc "removed task is gone from the store" 1 "$rc"
+
+  # the /dev/tty safety gate: without --force and no tty, rm aborts and the task stays.
+  # setsid detaches the controlling tty so this can't block on a real terminal.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$SKULD" rm 2 </dev/null >/dev/null 2>&1; rc=$?
+    assert_rc       "rm without --force + no tty aborts (rc 0)" 0 "$rc"
+    assert_contains "rm safety gate leaves the task in place"   "$(cat "$SKULD_HOME/tasks.tsv")" "kept"
+  else
+    skip "rm without --force + no tty aborts (rc 0)" "no setsid"
+    skip "rm safety gate leaves the task in place"   "no setsid"
+  fi
+
+  # missing / non-integer id
+  "$SKULD" rm 99 --force >/dev/null 2>&1; rc=$?; assert_rc "rm missing id is rc 1"     1 "$rc"
+  "$SKULD" rm 4x --force >/dev/null 2>&1; rc=$?; assert_rc "rm non-integer id is rc 1" 1 "$rc"
+
+  # 'del' is an alias for rm
+  "$SKULD" del 2 --force >/dev/null 2>&1; rc=$?
+  assert_rc      "del is an alias for rm" 0 "$rc"
+  assert_missing "del removed the task"   "$(cat "$SKULD_HOME/tasks.tsv")" "kept"
+}
+
 # ── run everything ───────────────────────────────────────────────────────────────
 printf '\nskuld test harness — %s\n\n' "$SKULD"
 [ -x "$SKULD" ] || { printf 'skuld not executable at %s\n' "$SKULD" >&2; exit 2; }
@@ -280,6 +362,9 @@ t_due_validation
 t_int_dispatch
 t_close_reopen
 t_close_reopen_errors
+t_edit
+t_edit_roundtrip
+t_rm
 t_atomic
 t_pipe_safety
 t_ladder
