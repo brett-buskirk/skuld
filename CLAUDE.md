@@ -74,28 +74,42 @@ job: it stores **structured records**, it runs a **state machine** over them, an
   This is what lets skuld compose into other automation. The fancy filtering can wait; the stable
   output contract cannot.
 
-## The script, to build
+## The script, at a glance
 
-There is **no `skuld` script yet** — build it as one file, `set -uo pipefail`, mirroring edda/the
-pack. Top→bottom: header comment (the Norn framing + usage synopsis) → `VERSION` → `SELF`/`HERE` →
-**config/store resolution** (`SKULD_HOME` env > `${SKULD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/skuld/config}`
-> `${XDG_DATA_HOME:-$HOME/.local/share}/skuld`) → palette (TTY + `NO_COLOR` aware) → helpers (`have` /
-`is_help` / `note` / `store_read` / `store_write` / `next_id` / `fmt_task` / `is_overdue` / `age_short`)
-→ `ensure_store` → the `cmd_*` functions (each guarded by `is_help`, while-loop `case` arg parsing) →
-`help_*` → the `case` dispatcher, **with the empty→`list` and integer→`show` arms as the default
-path**. Two-level help (`skuld help`, `skuld <cmd> help`). Respects `NO_COLOR` / non-TTY.
+One file, `skuld`, `set -uo pipefail`. Deps: **`bash` + coreutils only** — fully offline. Read
+top→bottom:
 
-Surface (v1): **`add`/`new` · `list`/`ls` · `show`/`view` · `close`/`done` · `reopen` · `edit` · `rm`
-· `init`**, plus `help` / `version`.
-- `list` defaults to **open only**; `--closed`, `--all`, `--priority high`, `--overdue`, `--sort
-  due|priority|created|id`, `--reverse`, `--porcelain`. Print a one-line summary footer (`3 open · 1
-  overdue · 12 done`).
-- `add`: positional name; `-d/--desc`, `-H/--high` or `--priority`, `--due YYYY-MM-DD`.
-- `edit`: flag-based field edits (`--name`/`--desc`/`--priority`/`--due`) for scriptability; `$EDITOR`-
-  on-record optional.
-- `rm`: soft-delete to `.trash/`, confirm or `--force`.
-ROADMAP (out for v1): tags/projects, recurring tasks, subtasks, reminders, `stats`, `cancelled` state,
-natural-language dues, JSONL store.
+- **Header** (the Norn framing + usage synopsis) → `VERSION` → the **config/store ladder**
+  (`SKULD_HOME` env > `$SKULD_CONFIG` file > `${XDG_DATA_HOME:-~/.local/share}/skuld`), which also
+  fixes `STORE` (`tasks.tsv`), `TRASH` (`.trash/`), and `US` (the 0x1f internal field separator) →
+  the frozen column-order comment → the **palette** (TTY + `NO_COLOR` aware).
+- **Small helpers:** `is_help` · `note` · `is_int` · `now_iso`/`today` (portable `date -u`) ·
+  `valid_due` (strict `YYYY-MM-DD` regex) · `is_overdue` (lexical `due < today`, no date math).
+- **The storage seam — the ONLY code that knows the on-disk format:** `enc`/`dec` (escape/unescape
+  `\t`, `\n`, `\\`; `dec` is a single left-to-right pass) → `store_read` (TAB→US, skips blanks) →
+  `store_write` (**atomic**: US→TAB into a temp *beside* the store, then `mv`; temp cleaned on every
+  failure/interrupt) → `next_id` (max+1, never reused) → `build_record` → `find_task` / `field` →
+  `set_task_state` (close/reopen's mutator) / `replace_task` (edit's mutator — passes the new record
+  via **`ENVIRON`, never `awk -v`**, so its escapes survive) → `ensure_store`.
+- **The `cmd_*` functions** (each guarded by `is_help`, then `case` arg parsing): `cmd_init` →
+  `cmd_add` → the list stack (`read_totals` · `filter_key` · `list_label` · `cmd_list` · `fmt_row`) →
+  `cmd_show` → `cmd_close`/`cmd_reopen` → `cmd_edit` → `confirm` (the `/dev/tty` spine) → `cmd_rm`.
+- **`help_*`** (per-command detail) → **`cmd_help`** (the menu) → the **`case` dispatcher** — closed,
+  with the empty→`list` and integer→`show` arms as the default path.
+
+Surface (v1, shipped in v1.0.0): **`add`/`new` · `list`/`ls` · `show`/`view` · `close`/`done` ·
+`reopen` · `edit` · `rm`/`del` · `init`**, plus `help` / `version`. `list` defaults to open-only with
+filters (`--closed`/`--all`/`--overdue`/`--priority`), `--sort id|due|priority|created`, `--reverse`,
+and `--porcelain`; its footer (`N open · N overdue · N done`) is always store-wide. Two-level help
+(`skuld help`, `skuld <cmd> help`). Respects `NO_COLOR` / non-TTY.
+
+The record's 8 fixed columns — **frozen**, later versions append and never reorder:
+`id ⇥ status ⇥ priority ⇥ created ⇥ due ⇥ completed ⇥ name ⇥ description` (TAB-separated on disk,
+US-separated internally, `name`/`description` backslash-encoded). `--porcelain` emits exactly this.
+
+Note the file mirrors edda's shape but does **not** carry every helper the pack template lists: there's
+no `SELF`/`HERE`, `have`, `fmt_task`, or `age_short` (unused → they'd trip `SC2034`); the list row
+formatter is `fmt_row`. What's next lives in `ROADMAP.md`.
 
 ## Gotchas (write a test for each)
 
@@ -119,9 +133,9 @@ natural-language dues, JSONL store.
 
 ## Editing & shipping
 
-- Every change must be `bash -n skuld` + `shellcheck skuld` clean. **Add the missing CI gate:** the
-  scaffold wires AgentGate but not the `.github/workflows/shellcheck.yml` the rest of the pack runs on
-  every push/PR — port it from `edda`/`vegtam` as the first infra PR (same gap edda had).
+- Every change must be `bash -n skuld` + `shellcheck skuld` clean, and keep `test/run.sh` green. CI
+  runs all three on every push/PR: `.github/workflows/shellcheck.yml` (`bash -n` + `shellcheck`) and
+  `.github/workflows/test.yml` (`bash test/run.sh`), alongside AgentGate.
 - **Test with a throwaway store** (`SKULD_HOME="$(mktemp -d)"`): add/list/close/reopen/edit + `rm`-
   lands-in-`.trash`; TSV round-trip with nasty fields; atomic-write leaves the old store intact on
   simulated failure; `next_id` monotonic and never-reused; overdue detection; `--porcelain` stability
@@ -131,16 +145,17 @@ natural-language dues, JSONL store.
 
 ## Status
 
-**Assumes the standard scaffold** — the same template as edda: MIT; AgentGate wired (`scope` →
-warning, `secrets` + `dangerous_patterns` → error); doc suite stubbed; `.gitignore` covering
-`.DS_Store` / `*.log`; **no `skuld` script yet, no `shellcheck.yml` yet,** ROADMAP milestone undefined,
-README a one-liner. If the actual repo differs (an existing `CLAUDE.md`, a started script), reconcile
-against reality first.
+**v1.0.0 — shipped.** The full v1 surface is built, tested (130 checks), and CI-gated
+(`shellcheck` + `test` + AgentGate). The whole locked design is in: structured records behind the
+`store_read`/`store_write` seam, atomic writes, the `open ⇄ closed` state machine, `.trash/`
+soft-delete, filters/sort, and the frozen `--porcelain` contract. It was built as a stack of focused
+PRs (skeleton+init → add/list/show → close/reopen → edit/rm → filters/porcelain → this docs pass),
+plus a small CI PR that added `test.yml`. See `CHANGELOG.md` / `ROADMAP.md` for the record and what's
+next; `## The script, at a glance` above narrates the real file.
 
-First milestone: **`init` + `add` + `list`** — scaffold the store, add a task, see your open tasks
-(the smallest useful loop). Then `close`/`reopen`, then `show`/`edit`/`rm`, then the shellcheck gate.
-**Once the script exists, replace "The script, to build" with a "The script, at a glance" section that
-narrates the real file top→bottom**, the way vegtam's manual does.
+For work from here: keep every change `bash -n` + `shellcheck` + `test/run.sh` clean, bump `VERSION`,
+keep the docs in sync, and after a PR merges refresh Brett's installed copy
+(`install -m 0755 skuld ~/.local/bin/skuld`).
 
 ## Reference
 
