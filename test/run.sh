@@ -347,6 +347,73 @@ t_rm(){
   assert_missing "del removed the task"   "$(cat "$SKULD_HOME/tasks.tsv")" "kept"
 }
 
+# ── list filters: --closed / --all / --priority / --overdue ──────────────────────
+t_list_filters(){
+  fresh; "$SKULD" init >/dev/null
+  "$SKULD" add "open std"                      >/dev/null   # 1 open, standard, no due
+  "$SKULD" add -H "open high"                  >/dev/null   # 2 open, high, no due
+  "$SKULD" add --due 2000-01-01 "open overdue" >/dev/null   # 3 open, overdue (past due)
+  "$SKULD" add "will close"                    >/dev/null   # 4
+  "$SKULD" close 4 >/dev/null                               # 4 closed
+
+  assert_contains "default lists open"          "$("$SKULD" list)" "open std"
+  assert_missing  "default hides closed"        "$("$SKULD" list)" "will close"
+  assert_contains "--closed shows closed"       "$("$SKULD" list --closed)" "will close"
+  assert_missing  "--closed hides open"         "$("$SKULD" list --closed)" "open std"
+  assert_eq       "--all shows every task"      "4" "$("$SKULD" list --all --porcelain | grep -c '')"
+  assert_contains "--priority high shows high"  "$("$SKULD" list --priority high)" "open high"
+  assert_missing  "--priority high hides std"   "$("$SKULD" list --priority high)" "open std"
+  assert_contains "--overdue shows overdue"     "$("$SKULD" list --overdue)" "open overdue"
+  assert_missing  "--overdue hides non-overdue" "$("$SKULD" list --overdue)" "open std"
+
+  local rc
+  "$SKULD" list --priority huge >/dev/null 2>&1; rc=$?; assert_rc "bad --priority is rc 1" 1 "$rc"
+  "$SKULD" list --sort bogus    >/dev/null 2>&1; rc=$?; assert_rc "bad --sort is rc 1"     1 "$rc"
+}
+
+# ── list sorting: --sort id|due|priority|created + --reverse ──────────────────────
+t_list_sort(){
+  fresh; "$SKULD" init >/dev/null
+  "$SKULD" add --due 2026-03-01 "beta"  >/dev/null   # 1
+  "$SKULD" add --due 2026-01-01 "alpha" >/dev/null   # 2 (earliest due)
+  "$SKULD" add -H "gamma"               >/dev/null   # 3 (high, no due)
+
+  # names read from the frozen porcelain column, so order is asserted exactly
+  assert_eq "default sort is by id"          $'beta\nalpha\ngamma' "$("$SKULD" list --porcelain | cut -f7)"
+  assert_eq "sort by due (no-due last)"      $'alpha\nbeta\ngamma' "$("$SKULD" list --sort due --porcelain | cut -f7)"
+  assert_eq "sort by priority (high first)"  "gamma"               "$("$SKULD" list --sort priority --porcelain | cut -f7 | head -1)"
+  assert_eq "reverse flips the order"        $'gamma\nalpha\nbeta' "$("$SKULD" list --reverse --porcelain | cut -f7)"
+}
+
+# ── --porcelain: the frozen, escape-free, one-line-per-record contract ───────────
+t_porcelain(){
+  fresh; "$SKULD" init >/dev/null
+  "$SKULD" add -H --due 2000-01-01 -d "d1" "first" >/dev/null   # 1
+  "$SKULD" add "second" >/dev/null                              # 2
+
+  local p; p="$("$SKULD" list --porcelain)"
+  assert_no_esc "list --porcelain: zero escape bytes" "$p"
+  assert_eq     "porcelain: one line per open task"   "2" "$(printf '%s\n' "$p" | grep -c '')"
+  local l1; l1="$(printf '%s\n' "$p" | head -1)"
+  assert_eq "porcelain col1 = id"       "1"          "$(printf '%s' "$l1" | cut -f1)"
+  assert_eq "porcelain col2 = status"   "open"       "$(printf '%s' "$l1" | cut -f2)"
+  assert_eq "porcelain col3 = priority" "high"       "$(printf '%s' "$l1" | cut -f3)"
+  assert_eq "porcelain col5 = due"      "2000-01-01" "$(printf '%s' "$l1" | cut -f5)"
+  assert_eq "porcelain col7 = name"     "first"      "$(printf '%s' "$l1" | cut -f7)"
+  assert_eq "porcelain col8 = desc"     "d1"         "$(printf '%s' "$l1" | cut -f8)"
+
+  local sp; sp="$("$SKULD" show 2 --porcelain)"
+  assert_no_esc "show --porcelain: zero escapes" "$sp"
+  assert_eq     "show --porcelain col7 = name"   "second" "$(printf '%s' "$sp" | cut -f7)"
+
+  # specials stay backslash-encoded → each record is one parseable line
+  "$SKULD" add --desc $'multi\nline' $'tab\tname' >/dev/null   # 3
+  local p3; p3="$("$SKULD" show 3 --porcelain)"
+  assert_eq       "porcelain record is one physical line" "1" "$(printf '%s\n' "$p3" | grep -c '')"
+  assert_contains "porcelain encodes a tab in name"       "$p3" 'tab\tname'
+  assert_contains "porcelain encodes a newline in desc"   "$p3" 'multi\nline'
+}
+
 # ── run everything ───────────────────────────────────────────────────────────────
 printf '\nskuld test harness — %s\n\n' "$SKULD"
 [ -x "$SKULD" ] || { printf 'skuld not executable at %s\n' "$SKULD" >&2; exit 2; }
@@ -355,6 +422,9 @@ t_init
 t_init_idempotent
 t_add_list_show
 t_list_empty_and_counts
+t_list_filters
+t_list_sort
+t_porcelain
 t_tsv_roundtrip
 t_backslash_roundtrip
 t_next_id
