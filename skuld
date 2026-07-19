@@ -9,7 +9,10 @@
 # $SKULD_HOME, mutations are atomic, nothing is ever hard-deleted, and skuld never
 # phones home.
 #
-#   skuld init               scaffold the store
+#   skuld add <name…>        add a task            skuld list              open tasks
+#   skuld show <id>          a task in full        skuld init              scaffold the store
+#   skuld                    (no verb) list open tasks
+#   skuld <id>               (no verb) show that task
 #
 #   skuld help  ·  skuld <command> help   for the menu and per-command detail.
 #
@@ -19,7 +22,7 @@
 # shellcheck disable=SC2059  # color vars are fixed ANSI codes, deliberately embedded in format strings
 set -uo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # ── configuration — env  >  config file  >  default store ─────────────────────
 # The muninn ladder: capture the SKULD_HOME env override *before* sourcing the
@@ -34,6 +37,12 @@ DEFAULT_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/skuld"
 SKULD_HOME="${_env_HOME:-${SKULD_HOME:-$DEFAULT_HOME}}"
 STORE="$SKULD_HOME/tasks.tsv"          # the ledger: one task per line, tab-separated
 TRASH="$SKULD_HOME/.trash"             # soft-deletes land here; never a hard delete
+US=$'\x1f'                             # internal field separator (see store_read)
+
+# The fixed column order of a task record. The store is TSV on disk; internally
+# records use US (0x1f) between fields (see store_read for why). This order is the
+# machine-readable contract — later versions append, never reorder.
+#   id ⇥ status ⇥ priority ⇥ created ⇥ due ⇥ completed ⇥ name ⇥ description
 
 # ── palette — color only on a TTY, and never when NO_COLOR is set ─────────────
 # Same convention as the rest of the pack: piped/redirected output, or NO_COLOR,
@@ -45,6 +54,107 @@ else R=; G=; Y=; C=; DIM=; BD=; X=; fi
 # ── small helpers ─────────────────────────────────────────────────────────────
 is_help(){ case "${1:-}" in help|-h|--help) return 0;; *) return 1;; esac; }
 note(){ printf "    ${DIM}%s${X}\n" "$1"; }                    # a dim aside
+is_int(){ case "${1:-}" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
+now_iso(){ date -u +%FT%TZ; }                                 # 2026-07-19T08:44:00Z (GNU+BSD)
+today(){ date -u +%F; }                                       # 2026-07-19
+
+# valid_due <s> — v1 accepts ONLY YYYY-MM-DD. The regex enforces the shape plus a sane
+# month (01–12) and day (01–31), so obvious junk (2026-13-40, "tomorrow", 07/20/2026)
+# is rejected rather than silently stored. Full calendar validity (no Feb 30) needs
+# date math (GNU-only) and is a roadmap nicety; overdue detection is lexical regardless.
+valid_due(){ [[ "${1:-}" =~ ^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$ ]]; }
+
+# is_overdue <due> <status> <today> — has a due, still open, and due < today. ISO
+# YYYY-MM-DD compares lexically, so no date arithmetic is needed (or wanted — lexical
+# comparison keeps overdue detection portable).
+is_overdue(){
+  local due="$1" status="$2" ref="$3"
+  [ -n "$due" ] && [ "$status" = open ] && [[ "$due" < "$ref" ]]
+}
+
+# ── storage seam — the ONLY code that knows the on-disk format ─────────────────
+# enc/dec escape the two field-shearing characters (tab, newline) plus the escape
+# character itself, so a name or description survives write→read byte-identical and a
+# record always stays on ONE physical line. Backslash is escaped FIRST on encode and
+# decoded LAST (via a single left-to-right pass) so a literal "C:\temp" round-trips.
+enc(){
+  local s="${1:-}"
+  s="${s//\\/\\\\}"     # \  → \\   (must be first)
+  s="${s//$'\t'/\\t}"   # TAB → \t
+  s="${s//$'\n'/\\n}"   # LF  → \n
+  printf '%s' "$s"
+}
+dec(){
+  local s="${1:-}"
+  case "$s" in *\\*) ;; *) printf '%s' "$s"; return;; esac   # no escapes → fast path
+  local out="" i c nx n=${#s} bs=$'\\'
+  for (( i=0; i<n; i++ )); do
+    c="${s:i:1}"
+    if [ "$c" = "$bs" ] && [ $(( i + 1 )) -lt "$n" ]; then
+      nx="${s:i+1:1}"
+      case "$nx" in
+        t)     out+=$'\t'; i=$(( i + 1 ));;
+        n)     out+=$'\n'; i=$(( i + 1 ));;
+        "$bs") out+="$bs"; i=$(( i + 1 ));;
+        *)     out+="$c";;                                    # lone backslash — keep as-is
+      esac
+    else
+      out+="$c"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+# store_read — emit every task record, one per line, fields separated by US. On disk
+# the store is TAB-separated (human-readable, greppable); internally we use US (0x1f)
+# because TAB is IFS-whitespace and a `read` split would COLLAPSE empty due/completed
+# columns, shearing every later field. US is non-whitespace, so `read` keeps the empty
+# fields. This TAB↔US translation is why the whole rest of the tool never touches the
+# on-disk format — the documented JSONL upgrade reimplements ONLY this + store_write.
+store_read(){
+  [ -f "$STORE" ] || return 0
+  awk 'NF' "$STORE" | tr '\t' '\037'
+}
+
+# store_write — atomically REPLACE the store with the US-separated records on stdin.
+# The marquee correctness rule: write a temp IN THE STORE DIR (same filesystem, so the
+# mv is a true rename — a cross-mount mv would copy+unlink and lose atomicity), then mv
+# it into place. A crash or Ctrl-C mid-write leaves the PREVIOUS store fully intact,
+# never a half-applied rewrite; the temp is cleaned on every failure/interrupt path.
+store_write(){
+  local tmp rc
+  tmp="$(mktemp "$SKULD_HOME/.skuld-tmp.XXXXXX")" || {
+    printf "  ${R}✗ couldn't create a temp file in %s${X}\n" "$SKULD_HOME" >&2; return 1; }
+  trap 'rm -f "$tmp"' INT TERM
+  if tr '\037' '\t' > "$tmp" && mv "$tmp" "$STORE"; then rc=0; else rc=1; rm -f "$tmp"; fi
+  trap - INT TERM
+  return "$rc"
+}
+
+# next_id — highest id in the US-separated records on stdin, plus one; 1 for an empty
+# store. IDs are monotonic and NEVER reused (max+1, not a count), so a deleted #4 never
+# returns. cmd_add computes this from the same snapshot it rewrites, so a single add is
+# self-consistent; a cross-process flock against two simultaneous adds is roadmap.
+next_id(){ awk 'BEGIN{FS="\037"; m=0}{ if ($1+0 > m) m=$1+0 } END{ print m+1 }'; }
+
+# build_record — assemble a record from its 8 fields (name/description encoded).
+build_record(){  # id status priority created due completed name description
+  printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$(enc "$7")" "$(enc "$8")"
+}
+
+# find_task <id> — print the US-separated record whose id matches (numeric compare, so
+# "04" finds #4), reading records from stdin. Prints nothing when there's no match.
+find_task(){ awk -v id="$1" 'BEGIN{FS="\037"} ($1+0)==(id+0){ print; exit }'; }
+
+# ensure_store — every task-touching command runs this first; 'init' does not.
+ensure_store(){
+  [ -f "$STORE" ] && return 0
+  printf "\n  ${R}no store at${X} ${C}%s${X}\n" "$STORE"
+  note "run ${BD}skuld init${X} to create it, or point ${BD}SKULD_HOME${X} at an existing store."
+  printf "\n"
+  return 1
+}
 
 # ── init — scaffold the store (ledger + .trash/) and a starter config ──────────
 cmd_init(){
@@ -94,6 +204,142 @@ CFG
   printf "\n"
 }
 
+# ── add — append a task; the whole store is rewritten atomically ───────────────
+cmd_add(){
+  is_help "${1:-}" && { help_add; return 0; }
+  local desc="" priority="standard" due=""
+  local -a names=()
+  # Flags interleave with the name words; a lone name word starts collecting the name.
+  while [ $# -gt 0 ]; do case "$1" in
+    -d|--desc|--description) shift; desc="${1:-}";;
+    -H|--high)               priority="high";;
+    --priority)              shift
+      case "${1:-}" in
+        standard|high) priority="$1";;
+        *) printf "\n  ${R}✗ unknown priority:${X} ${BD}%s${X} ${DIM}(use: standard | high)${X}\n\n" "${1:-}"; return 1;;
+      esac;;
+    --due)                   shift; due="${1:-}";;
+    --)                      shift; while [ $# -gt 0 ]; do names+=("$1"); shift; done; break;;
+    -*)                      printf "  ${Y}ignoring unknown option: %s${X}\n" "$1";;
+    *)                       names+=("$1");;
+  esac; shift; done
+
+  ensure_store || return 1
+  local name="${names[*]}"
+  if [ -z "${name// /}" ]; then
+    printf "\n  ${R}usage:${X} skuld add [-H] [--due YYYY-MM-DD] [-d desc] <name…>\n\n"; return 1
+  fi
+  if [ -n "$due" ] && ! valid_due "$due"; then
+    printf "\n  ${R}✗ invalid --due:${X} ${BD}%s${X} ${DIM}(v1 accepts only YYYY-MM-DD, e.g. %s)${X}\n\n" "$due" "$(today)"; return 1
+  fi
+
+  # next_id + append run against ONE snapshot, then the whole store is rewritten
+  # atomically. Computing the id from the same snapshot we rewrite keeps a single add
+  # self-consistent (see next_id / store_write).
+  local snapshot next created rec
+  snapshot="$(store_read)"
+  next="$(printf '%s' "$snapshot" | next_id)"
+  created="$(now_iso)"
+  rec="$(build_record "$next" open "$priority" "$created" "$due" "" "$name" "$desc")"
+  if ! { [ -n "$snapshot" ] && printf '%s\n' "$snapshot"; printf '%s\n' "$rec"; } | store_write; then
+    printf "\n  ${R}✗ couldn't write the task — the store is unchanged.${X}\n\n"; return 1
+  fi
+
+  printf "\n  ${G}✓ added${X} ${DIM}#%s${X} ${BD}%s${X}" "$next" "$name"
+  [ "$priority" = high ] && printf "  ${Y}!${X}"
+  [ -n "$due" ] && printf "  ${DIM}due %s${X}" "$due"
+  printf "\n\n"
+}
+
+# ── list — open tasks by default, with a one-line summary footer ───────────────
+cmd_list(){
+  is_help "${1:-}" && { help_list; return 0; }
+  # v1 slice: open-only. The filters (--closed/--all/--priority/--overdue), --sort/
+  # --reverse, and --porcelain are a later PR; unknown flags warn rather than error.
+  local a
+  for a in "$@"; do case "$a" in
+    -*) printf "  ${Y}ignoring unknown option: %s${X} ${DIM}(filters/sort arrive in a later version)${X}\n" "$a";;
+  esac; done
+  ensure_store || return 1
+
+  local nowday; nowday="$(today)"
+  local -a rows=()
+  local open=0 overdue=0 closed=0
+  # A record's 8 US-separated fields; the process substitution keeps the counters in
+  # this shell (a `store_read | while` would tally them in a lost subshell).
+  local id status priority created due completed name desc
+  # created/completed/desc are consumed positionally here only to reach name.
+  # shellcheck disable=SC2034
+  while IFS="$US" read -r id status priority created due completed name desc; do
+    [ -z "$id" ] && continue
+    if [ "$status" = closed ]; then closed=$(( closed + 1 )); continue; fi
+    open=$(( open + 1 ))
+    local od=0
+    if is_overdue "$due" "$status" "$nowday"; then overdue=$(( overdue + 1 )); od=1; fi
+    rows+=("$(fmt_row "$id" "$priority" "$due" "$od" "$name")")
+  done < <(store_read)
+
+  printf "\n  ${BD}skuld${X}  ${DIM}·  open tasks${X}\n\n"
+  if [ "${#rows[@]}" -eq 0 ]; then
+    note "no open tasks — 'skuld add <name>' to add one."
+  else
+    local r; for r in "${rows[@]}"; do printf '%s\n' "$r"; done
+  fi
+  printf "\n  ${DIM}%d open · %d overdue · %d done${X}\n\n" "$open" "$overdue" "$closed"
+}
+
+# fmt_row <id> <priority> <due> <overdue-flag> <name> — one aligned task line for the
+# human list. The name is decoded and squashed to a single line (tabs/newlines → space)
+# so a multi-line description or a tab in the name can't shear the row.
+fmt_row(){
+  local id="$1" priority="$2" due="$3" od="$4" name="$5"
+  local pmark="  "; [ "$priority" = high ] && pmark="${Y}!${X} "
+  local dname; dname="$(dec "$name")"
+  dname="${dname//$US/ }"; dname="${dname//$'\t'/ }"; dname="${dname//$'\n'/ }"
+  local duestr=""
+  if [ -n "$due" ]; then
+    if [ "$od" = 1 ]; then duestr="  ${R}due $due (overdue)${X}"; else duestr="  ${DIM}due $due${X}"; fi
+  fi
+  printf "    ${DIM}%3s${X} %s${BD}%s${X}%s" "$id" "$pmark" "$dname" "$duestr"
+}
+
+# ── show — one task in full ────────────────────────────────────────────────────
+cmd_show(){
+  is_help "${1:-}" && { help_show; return 0; }
+  local id="" a
+  for a in "$@"; do case "$a" in
+    -*) printf "  ${Y}ignoring unknown option: %s${X}\n" "$a";;
+    *) [ -z "$id" ] && id="$a";;
+  esac; done
+  ensure_store || return 1
+  [ -z "$id" ] && { printf "\n  ${R}usage:${X} skuld show <id>\n\n"; return 1; }
+  if ! is_int "$id"; then
+    printf "\n  ${R}✗ not a task id:${X} ${BD}%s${X} ${DIM}(task ids are integers)${X}\n\n" "$id"; return 1
+  fi
+  local rec; rec="$(store_read | find_task "$id")"
+  if [ -z "$rec" ]; then
+    printf "\n  ${R}✗ no task${X} ${BD}#%s${X}\n" "$(( 10#$id ))"
+    note "list your open tasks with:  skuld list"
+    printf "\n"; return 1
+  fi
+  local f_id f_status f_priority f_created f_due f_completed f_name f_desc
+  IFS="$US" read -r f_id f_status f_priority f_created f_due f_completed f_name f_desc <<< "$rec"
+
+  local nowday; nowday="$(today)"
+  local pmark=""; [ "$f_priority" = high ] && pmark="${Y}!${X} "
+  local od=""; is_overdue "$f_due" "$f_status" "$nowday" && od="  ${R}(overdue)${X}"
+  local statuscol="$G"; [ "$f_status" = closed ] && statuscol="$DIM"
+
+  printf "\n  ${BD}#%s${X}  %s${BD}%s${X}\n\n" "$f_id" "$pmark" "$(dec "$f_name")"
+  printf "    ${DIM}status${X}     %s%s${X}\n"    "$statuscol" "$f_status"
+  printf "    ${DIM}priority${X}   %s\n"          "$f_priority"
+  printf "    ${DIM}created${X}    %s\n"          "$f_created"
+  [ -n "$f_due" ]       && printf "    ${DIM}due${X}        %s%s\n" "$f_due" "$od"
+  [ -n "$f_completed" ] && printf "    ${DIM}completed${X}  %s\n"   "$f_completed"
+  [ -n "$f_desc" ]      && printf "\n    ${DIM}%s${X}\n" "$(dec "$f_desc")"
+  printf "\n"
+}
+
 # ── per-command help ──────────────────────────────────────────────────────────
 help_init(){
   printf "\n  ${BD}skuld init${X} [--force]\n\n"
@@ -103,30 +349,69 @@ help_init(){
   printf "  Resolves the store the same way every command does: ${BD}SKULD_HOME${X} env > the config file\n"
   printf "  > the default ${DIM}(%s)${X}.\n\n" "$DEFAULT_HOME"
 }
+help_add(){
+  printf "\n  ${BD}skuld add${X} [-H] [--priority std|high] [--due YYYY-MM-DD] [-d desc] <name…>   ${DIM}(alias: new)${X}\n\n"
+  printf "  Add a task. The ${BD}name${X} is the positional text; everything else is a flag, so a task\n"
+  printf "  starts ${BD}open${X}, ${BD}standard${X} priority, no due date. The store is rewritten atomically.\n\n"
+  printf "  ${BD}Options${X}\n"
+  printf "    -H, --high              high priority ${DIM}(the flag for higher)${X}\n"
+  printf "        --priority <level>  set priority explicitly: ${BD}standard${X} | ${BD}high${X}\n"
+  printf "        --due <YYYY-MM-DD>  a due date ${DIM}(v1 accepts only that exact ISO format)${X}\n"
+  printf "    -d, --desc <text>       a longer description\n\n"
+  printf "  ${BD}Example${X}\n"
+  printf "    skuld add -H --due 2026-08-01 -d \"draft + review\" \"Ship the release\"\n\n"
+}
+help_list(){
+  printf "\n  ${BD}skuld list${X}   ${DIM}(alias: ls)${X}\n\n"
+  printf "  List your ${BD}open${X} tasks — id, priority ${DIM}(!)${X}, name, and due date, with overdue dates\n"
+  printf "  called out. Closes with a summary footer ${DIM}(N open · N overdue · N done)${X}.\n\n"
+  printf "  ${DIM}Bare ${X}${BD}skuld${X}${DIM} with no verb is the same as ${X}${BD}skuld list${X}${DIM}. Filters, sorting, and a\n"
+  printf "  --porcelain mode land in a later version.${X}\n\n"
+}
+help_show(){
+  printf "\n  ${BD}skuld show${X} <id>   ${DIM}(alias: view)${X}\n\n"
+  printf "  Show one task in full — status, priority, timestamps, due date, and description.\n"
+  printf "  ${DIM}Bare ${X}${BD}skuld <id>${X}${DIM} with no verb is the same as ${X}${BD}skuld show <id>${X}${DIM} (an integer is\n"
+  printf "  unambiguously not a verb).${X}\n\n"
+}
 
 # ── help — the menu ────────────────────────────────────────────────────────────
 cmd_help(){
   printf "\n  ${BD}skuld${X} ${DIM}— the ledger of what you owe your future self · v%s${X}\n\n" "$VERSION"
+  printf "  ${DIM}write${X}\n"
+  printf "    ${BD}add${X} <name…>               add a task ${DIM}(-H high · --due · -d desc · alias: new)${X}\n"
+  printf "  ${DIM}read${X}\n"
+  printf "    ${BD}list${X}                      open tasks, with a summary footer ${DIM}(alias: ls)${X}\n"
+  printf "    ${BD}show${X} <id>                 one task in full ${DIM}(alias: view)${X}\n"
   printf "  ${DIM}setup${X}\n"
   printf "    ${BD}init${X}                      scaffold the store + a starter config\n"
   printf "    ${BD}help${X} ${DIM}·${X} ${BD}version${X}          this menu · the version\n\n"
+  printf "  ${DIM}fast-path:${X} ${BD}skuld${X} ${DIM}lists open tasks · ${X}${BD}skuld <id>${X} ${DIM}shows that task.${X}\n"
   printf "  ${DIM}store:${X} ${C}%s${X}\n" "$SKULD_HOME"
   printf "  ${DIM}run${X} ${BD}skuld <command> help${X} ${DIM}for details on any command.${X}\n\n"
 }
 
-# ── dispatch — verbs win the first position ─────────────────────────────────────
+# ── dispatch — verbs win the first position; two non-verb arms are the defaults ──
 # The dispatcher is CLOSED: only the fixed verb set reaches the first position. The
-# design's two non-verb arms — an empty invocation → 'list' open tasks, and a bare
-# integer → 'show' that task — arrive alongside those commands in a later PR; until
-# then the store can be scaffolded with 'init' and inspected via 'help'.
+# two non-verb arms are the design's ergonomic defaults — an empty invocation lists
+# open tasks (the daily driver), and a bare integer shows that task (an integer is
+# unambiguously not a verb). Nothing else free-form reaches this position.
 case "${1:-}" in
+  add|new)                shift; cmd_add "$@";;
+  list|ls)                shift; cmd_list "$@";;
+  show|view)              shift; cmd_show "$@";;
   init)                   shift; cmd_init "$@";;
   help|-h|--help)         cmd_help;;
   version|-V|--version)   printf "skuld %s\n" "$VERSION";;
-  "")                     cmd_help;;
+  "")                     cmd_list;;
   *)
-    printf "\n  ${R}no such command:${X} ${BD}%s${X}\n" "$1"
-    cmd_help
-    exit 1
+    if is_int "$1"; then
+      cmd_show "$1"
+    else
+      printf "\n  ${R}no such command:${X} ${BD}%s${X}\n" "$1"
+      note "a bare number shows that task; otherwise use a verb (see 'skuld help')."
+      cmd_help
+      exit 1
+    fi
     ;;
 esac
