@@ -10,7 +10,8 @@
 # phones home.
 #
 #   skuld add <name…>        add a task            skuld list              open tasks
-#   skuld show <id>          a task in full        skuld init              scaffold the store
+#   skuld show <id>          a task in full        skuld close <id>        mark it done
+#   skuld reopen <id>        reopen a task         skuld init              scaffold the store
 #   skuld                    (no verb) list open tasks
 #   skuld <id>               (no verb) show that task
 #
@@ -22,7 +23,7 @@
 # shellcheck disable=SC2059  # color vars are fixed ANSI codes, deliberately embedded in format strings
 set -uo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 
 # ── configuration — env  >  config file  >  default store ─────────────────────
 # The muninn ladder: capture the SKULD_HOME env override *before* sourcing the
@@ -146,6 +147,22 @@ build_record(){  # id status priority created due completed name description
 # find_task <id> — print the US-separated record whose id matches (numeric compare, so
 # "04" finds #4), reading records from stdin. Prints nothing when there's no match.
 find_task(){ awk -v id="$1" 'BEGIN{FS="\037"} ($1+0)==(id+0){ print; exit }'; }
+
+# field <n> — print field n of the US-separated record on stdin (1-based).
+field(){ awk -v n="$1" 'BEGIN{FS="\037"}{ print $n; exit }'; }
+
+# set_task_state <id> <status> <completed> — rewrite ONE task's status + completed and
+# atomically replace the store. Non-matching records pass through byte-identical (awk
+# only rebuilds $0 for the row it edits), so every other task's escapes are preserved.
+# The whole read→transform→write runs before the mv, so reading and writing the same
+# store is safe. This is the single mutator the state machine (close/reopen) drives.
+set_task_state(){
+  local id="$1" status="$2" completed="$3"
+  store_read \
+    | awk -v id="$id" -v st="$status" -v cp="$completed" \
+        'BEGIN{ FS=OFS="\037" } ($1+0)==(id+0){ $2=st; $6=cp } { print }' \
+    | store_write
+}
 
 # ensure_store — every task-touching command runs this first; 'init' does not.
 ensure_store(){
@@ -340,6 +357,60 @@ cmd_show(){
   printf "\n"
 }
 
+# ── close / reopen — the whole state machine: open ⇄ closed ─────────────────────
+# close (alias done) stamps 'completed' automatically; reopen clears it and flips back
+# to open. Binary and total — there is no third state in v1. Both are gentle no-ops on
+# a task already in the target state (so close never re-stamps an earlier completion),
+# and both fail cleanly on a non-integer or nonexistent id.
+cmd_close(){
+  is_help "${1:-}" && { help_close; return 0; }
+  local id="" a
+  for a in "$@"; do case "$a" in
+    -*) printf "  ${Y}ignoring unknown option: %s${X}\n" "$a";;
+    *) [ -z "$id" ] && id="$a";;
+  esac; done
+  ensure_store || return 1
+  [ -z "$id" ] && { printf "\n  ${R}usage:${X} skuld close <id>\n\n"; return 1; }
+  is_int "$id" || { printf "\n  ${R}✗ not a task id:${X} ${BD}%s${X} ${DIM}(task ids are integers)${X}\n\n" "$id"; return 1; }
+  local rec; rec="$(store_read | find_task "$id")"
+  if [ -z "$rec" ]; then
+    printf "\n  ${R}✗ no task${X} ${BD}#%s${X}\n" "$(( 10#$id ))"
+    note "list your open tasks with:  skuld list"; printf "\n"; return 1
+  fi
+  local name; name="$(dec "$(printf '%s' "$rec" | field 7)")"
+  if [ "$(printf '%s' "$rec" | field 2)" = closed ]; then
+    printf "\n  ${DIM}·${X} ${BD}#%s${X} is already closed.\n\n" "$(( 10#$id ))"; return 0
+  fi
+  if ! set_task_state "$id" closed "$(now_iso)"; then
+    printf "\n  ${R}✗ couldn't update the task — the store is unchanged.${X}\n\n"; return 1
+  fi
+  printf "\n  ${G}✓ closed${X} ${DIM}#%s${X} ${BD}%s${X}\n\n" "$(( 10#$id ))" "$name"
+}
+cmd_reopen(){
+  is_help "${1:-}" && { help_reopen; return 0; }
+  local id="" a
+  for a in "$@"; do case "$a" in
+    -*) printf "  ${Y}ignoring unknown option: %s${X}\n" "$a";;
+    *) [ -z "$id" ] && id="$a";;
+  esac; done
+  ensure_store || return 1
+  [ -z "$id" ] && { printf "\n  ${R}usage:${X} skuld reopen <id>\n\n"; return 1; }
+  is_int "$id" || { printf "\n  ${R}✗ not a task id:${X} ${BD}%s${X} ${DIM}(task ids are integers)${X}\n\n" "$id"; return 1; }
+  local rec; rec="$(store_read | find_task "$id")"
+  if [ -z "$rec" ]; then
+    printf "\n  ${R}✗ no task${X} ${BD}#%s${X}\n" "$(( 10#$id ))"
+    note "list all your tasks with:  skuld list"; printf "\n"; return 1
+  fi
+  local name; name="$(dec "$(printf '%s' "$rec" | field 7)")"
+  if [ "$(printf '%s' "$rec" | field 2)" = open ]; then
+    printf "\n  ${DIM}·${X} ${BD}#%s${X} is already open.\n\n" "$(( 10#$id ))"; return 0
+  fi
+  if ! set_task_state "$id" open ""; then
+    printf "\n  ${R}✗ couldn't update the task — the store is unchanged.${X}\n\n"; return 1
+  fi
+  printf "\n  ${G}✓ reopened${X} ${DIM}#%s${X} ${BD}%s${X}\n\n" "$(( 10#$id ))" "$name"
+}
+
 # ── per-command help ──────────────────────────────────────────────────────────
 help_init(){
   printf "\n  ${BD}skuld init${X} [--force]\n\n"
@@ -374,12 +445,25 @@ help_show(){
   printf "  ${DIM}Bare ${X}${BD}skuld <id>${X}${DIM} with no verb is the same as ${X}${BD}skuld show <id>${X}${DIM} (an integer is\n"
   printf "  unambiguously not a verb).${X}\n\n"
 }
+help_close(){
+  printf "\n  ${BD}skuld close${X} <id>   ${DIM}(alias: done)${X}\n\n"
+  printf "  Mark a task done — flips it to ${BD}closed${X} and stamps ${BD}completed${X} with the current time.\n"
+  printf "  Closed tasks drop off ${BD}skuld list${X} ${DIM}(but still count in its footer)${X}. Re-closing an\n"
+  printf "  already-closed task is a no-op, so an earlier completion time is never overwritten.\n\n"
+}
+help_reopen(){
+  printf "\n  ${BD}skuld reopen${X} <id>\n\n"
+  printf "  Reopen a closed task — flips it back to ${BD}open${X} and clears its ${BD}completed${X} stamp, so it\n"
+  printf "  returns to ${BD}skuld list${X}. Reopening an already-open task is a no-op.\n\n"
+}
 
 # ── help — the menu ────────────────────────────────────────────────────────────
 cmd_help(){
   printf "\n  ${BD}skuld${X} ${DIM}— the ledger of what you owe your future self · v%s${X}\n\n" "$VERSION"
   printf "  ${DIM}write${X}\n"
   printf "    ${BD}add${X} <name…>               add a task ${DIM}(-H high · --due · -d desc · alias: new)${X}\n"
+  printf "    ${BD}close${X} <id>                mark a task done ${DIM}(alias: done)${X}\n"
+  printf "    ${BD}reopen${X} <id>               reopen a closed task\n"
   printf "  ${DIM}read${X}\n"
   printf "    ${BD}list${X}                      open tasks, with a summary footer ${DIM}(alias: ls)${X}\n"
   printf "    ${BD}show${X} <id>                 one task in full ${DIM}(alias: view)${X}\n"
@@ -398,6 +482,8 @@ cmd_help(){
 # unambiguously not a verb). Nothing else free-form reaches this position.
 case "${1:-}" in
   add|new)                shift; cmd_add "$@";;
+  close|done)             shift; cmd_close "$@";;
+  reopen)                 shift; cmd_reopen "$@";;
   list|ls)                shift; cmd_list "$@";;
   show|view)              shift; cmd_show "$@";;
   init)                   shift; cmd_init "$@";;
