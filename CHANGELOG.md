@@ -6,6 +6,10 @@ All notable changes to skuld are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- **`CHEATSHEET.md`** — a one-page quick reference for every command, option, and behavior
+  (following the pack convention), linked from the README.
+
 ## [1.0.0] — 2026-07-19
 
 First release — the complete v1 task-tracker, one self-contained Bash script
