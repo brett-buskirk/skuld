@@ -78,6 +78,9 @@ The grammar is **verb-first**, with two ergonomic defaults: a bare `skuld` lists
 daily driver), and `skuld <id>` shows that task (an integer is unambiguously not a verb). Nothing else
 free-form reaches the dispatcher — verbs always win the first position.
 
+For a one-page reference to every command, option, and behavior, see the
+[**cheat sheet**](CHEATSHEET.md).
+
 ### `add` — capture a task
 
 ```sh
