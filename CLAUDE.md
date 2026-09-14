@@ -7,7 +7,7 @@ the directory walk and own the universal rules — this file does **not** restat
   merges**; never self-merge, never commit to `main`), signed commits, the safety floors, brand
   positioning, NIST AI RMF.
 - **`~/github-repos/CLAUDE.md`** (estate manual) — issue/PR wiring (assignee `brett-buskirk`, labels,
-  milestone, Estate board **#17**), the `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`
+  milestone, linked in Linear), the `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`
   trailer, the AgentGate `dangerous_patterns`-fires-in-prose quirk, the `brett-buskirk`-must-be-the-
   active-gh-account gotcha, the pack, and the estate memory.
 
